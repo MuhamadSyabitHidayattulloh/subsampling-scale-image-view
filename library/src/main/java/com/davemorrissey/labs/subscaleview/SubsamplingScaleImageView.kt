@@ -2,7 +2,6 @@ package com.davemorrissey.labs.subscaleview
 
 import android.annotation.SuppressLint
 import android.content.ContentResolver
-import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
