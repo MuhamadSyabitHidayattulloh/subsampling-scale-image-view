@@ -13,6 +13,7 @@ import android.graphics.Point
 import android.graphics.PointF
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.Animatable
 import android.net.Uri
 import android.os.Build
 import android.util.AttributeSet
@@ -32,11 +33,14 @@ import androidx.annotation.CheckResult
 import androidx.annotation.ColorInt
 import androidx.core.view.ViewConfigurationCompat
 import androidx.lifecycle.LifecycleOwner
+import com.davemorrissey.labs.subscaleview.decoder.AnimatedImage
+import com.davemorrissey.labs.subscaleview.decoder.AnimatedImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.DecoderFactory
 import com.davemorrissey.labs.subscaleview.decoder.ImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageRegionDecoder
+import com.davemorrissey.labs.subscaleview.decoder.ImageDecoderAnimatedImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.toUri
 import com.davemorrissey.labs.subscaleview.internal.Anim
 import com.davemorrissey.labs.subscaleview.internal.ClearingLifecycleObserver
@@ -79,6 +83,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	// Bitmap (preview or full image)
 	private var bitmap: Bitmap? = null
+
+	// Animated drawable (e.g. GIF, animated WebP, HEIF)
+	private var animatedImage: AnimatedImage? = null
 
 	// Whether the bitmap is a preview image
 	private var bitmapIsPreview: Boolean = false
@@ -269,6 +276,12 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private val decoderLock = ReentrantReadWriteLock(true)
 	public var bitmapDecoderFactory: DecoderFactory<out ImageDecoder> = SkiaImageDecoder.Factory()
 	public var regionDecoderFactory: DecoderFactory<out ImageRegionDecoder> = SkiaImageRegionDecoder.Factory()
+	public var animatedImageDecoderFactory: DecoderFactory<out AnimatedImageDecoder>? =
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+			ImageDecoderAnimatedImageDecoder.Factory()
+		} else {
+			null
+		}
 
 	// Debug values
 	protected val isDebugDrawingEnabled: Boolean
@@ -399,6 +412,17 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			}
 		}
 		ta.recycle()
+	}
+
+	override fun onAttachedToWindow() {
+		super.onAttachedToWindow()
+		attachAnimatedImage(animatedImage)
+	}
+
+	override fun onDetachedFromWindow() {
+		(animatedImage?.drawable as? Animatable)?.stop()
+		animatedImage?.drawable?.callback = null
+		super.onDetachedFromWindow()
 	}
 
 	@JvmOverloads
@@ -783,6 +807,32 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 				canvas.drawRect(sRect!!, tileBgPaint!!)
 			}
 			canvas.drawBitmap(bitmap!!, matrix2!!, bitmapPaint)
+		} else if (animatedImage != null) {
+			if (matrix2 == null) {
+				matrix2 = Matrix()
+			}
+			matrix2!!.reset()
+			matrix2!!.postScale(scale, scale)
+			matrix2!!.postRotate(getRequiredRotation().toFloat())
+			matrix2!!.postTranslate(vTranslate!!.x, vTranslate!!.y)
+			if (getRequiredRotation() == ORIENTATION_180) {
+				matrix2!!.postTranslate(scale * sWidth, scale * sHeight)
+			} else if (getRequiredRotation() == ORIENTATION_90) {
+				matrix2!!.postTranslate(scale * sHeight, 0f)
+			} else if (getRequiredRotation() == ORIENTATION_270) {
+				matrix2!!.postTranslate(0f, scale * sWidth)
+			}
+			canvas.save()
+			canvas.concat(matrix2!!)
+			if (tileBgPaint != null) {
+				if (sRect == null) {
+					sRect = RectF()
+				}
+				sRect!!.set(0f, 0f, sWidth.toFloat(), sHeight.toFloat())
+				canvas.drawRect(sRect!!, tileBgPaint!!)
+			}
+			animatedImage!!.drawable.draw(canvas)
+			canvas.restore()
 		}
 		if (isDebugDrawingEnabled) {
 			canvas.drawText(
@@ -1130,6 +1180,25 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		coroutineScope.cancel()
 	}
 
+	private fun attachAnimatedImage(animated: AnimatedImage?) {
+		if (animated == null) {
+			return
+		}
+		animated.drawable.setBounds(0, 0, animated.width, animated.height)
+		animated.drawable.callback = this
+		if (isAttachedToWindow) {
+			(animated.drawable as? Animatable)?.start()
+		}
+	}
+
+	private fun releaseAnimatedImage() {
+		animatedImage?.drawable?.let { drawable ->
+			(drawable as? Animatable)?.stop()
+			drawable.callback = null
+		}
+		animatedImage = null
+	}
+
 	private fun reset(isNewImage: Boolean) {
 		scale = 0f
 		scaleStart = 0f
@@ -1165,6 +1234,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 			} finally {
 				decoderLock.writeLock().unlock()
 			}
+			releaseAnimatedImage()
 			bitmap?.let {
 				if (!bitmapIsCached) {
 					it.recycle()
@@ -1374,20 +1444,45 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	private fun loadBitmap(source: Uri, preview: Boolean) {
 		coroutineScope.launch {
 			try {
+				val orientation = if (preview) {
+					null
+				} else {
+					async {
+						runInterruptible(backgroundDispatcher) {
+							getExifOrientation(context, source)
+						}
+					}
+				}
+				if (!preview) {
+					val animatedImageResult = animatedImageDecoderFactory?.let { factory ->
+						try {
+							runInterruptible(backgroundDispatcher) {
+								factory.make().decode(context, source)
+							}
+						} catch (error: Throwable) {
+							if (error is CancellationException) {
+								throw error
+							}
+							Log.w(TAG, "Animated image decoding failed, falling back to bitmap", error)
+							null
+						}
+					}
+					if (animatedImageResult != null) {
+						val orientationValue = orientation?.await() ?: ORIENTATION_0
+						onAnimatedImageLoaded(animatedImageResult, orientationValue)
+						return@launch
+					}
+				}
 				val bitmap = async {
 					runInterruptible(backgroundDispatcher) {
 						bitmapDecoderFactory.make().decode(context, source, downSampling)
 					}
 				}
-				val orientation = async {
-					runInterruptible(backgroundDispatcher) {
-						getExifOrientation(context, source)
-					}
-				}
 				if (preview) {
 					onPreviewLoaded(bitmap.await())
 				} else {
-					onImageLoaded(bitmap.await(), orientation.await(), false)
+					val orientationValue = orientation?.await() ?: ORIENTATION_0
+					onImageLoaded(bitmap.await(), orientationValue, false)
 				}
 			} catch (e: CancellationException) {
 				throw e
@@ -1527,6 +1622,9 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 	 * Checks whether the base layer of tiles or full size bitmap is ready.
 	 */
 	private fun isBaseLayerReady(): Boolean {
+		if (animatedImage != null) {
+			return true
+		}
 		if (bitmap != null && !bitmapIsPreview) {
 			return true
 		} else if (tileMap != null) {
@@ -1565,6 +1663,7 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (sWidth > 0 && sHeight > 0 && (sWidth != bitmap.width * downSampling || sHeight != bitmap.height * downSampling)) {
 			reset(false)
 		}
+		releaseAnimatedImage()
 		this.bitmap?.let { oldBitmap ->
 			if (this.bitmapIsCached) {
 				onImageEventListeners.onPreviewReleased()
@@ -1583,6 +1682,36 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		if (isDownsamplingChanged) {
 			onDownSamplingChanged()
 		}
+		val ready = checkReady()
+		val imageLoaded = checkImageLoaded()
+		if (ready || imageLoaded) {
+			invalidate()
+			requestLayout()
+		}
+	}
+
+	@Synchronized
+	private fun onAnimatedImageLoaded(animated: AnimatedImage, sOrientation: Int) {
+		this.bitmap?.let { oldBitmap ->
+			if (bitmapIsCached) {
+				onImageEventListeners.onPreviewReleased()
+			} else {
+				oldBitmap.recycle()
+			}
+		}
+		bitmap = null
+		bitmapIsPreview = false
+		bitmapIsCached = false
+		releaseAnimatedImage()
+		animatedImage = animated
+		attachAnimatedImage(animatedImage)
+		tileMap?.recycleAll()
+		tileMap = null
+		_downSampling = 1
+		fullImageSampleSize = 1
+		sWidth = animated.width
+		sHeight = animated.height
+		this.sOrientation = sOrientation
 		val ready = checkReady()
 		val imageLoaded = checkImageLoaded()
 		if (ready || imageLoaded) {
