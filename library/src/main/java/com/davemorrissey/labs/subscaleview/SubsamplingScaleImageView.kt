@@ -2,6 +2,7 @@ package com.davemorrissey.labs.subscaleview
 
 import android.annotation.SuppressLint
 import android.content.ContentResolver
+import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -37,10 +38,11 @@ import com.davemorrissey.labs.subscaleview.decoder.AnimatedImage
 import com.davemorrissey.labs.subscaleview.decoder.AnimatedImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.DecoderFactory
 import com.davemorrissey.labs.subscaleview.decoder.ImageDecoder
+import com.davemorrissey.labs.subscaleview.decoder.ImageDecoderAnimatedImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.ImageRegionDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageDecoder
 import com.davemorrissey.labs.subscaleview.decoder.SkiaImageRegionDecoder
-import com.davemorrissey.labs.subscaleview.decoder.ImageDecoderAnimatedImageDecoder
+import com.davemorrissey.labs.subscaleview.decoder.detectImageFormat
 import com.davemorrissey.labs.subscaleview.decoder.toUri
 import com.davemorrissey.labs.subscaleview.internal.Anim
 import com.davemorrissey.labs.subscaleview.internal.ClearingLifecycleObserver
@@ -52,6 +54,8 @@ import com.davemorrissey.labs.subscaleview.internal.Tile
 import com.davemorrissey.labs.subscaleview.internal.TileMap
 import com.davemorrissey.labs.subscaleview.internal.TouchEventDelegate
 import com.davemorrissey.labs.subscaleview.internal.getExifOrientation
+import com.davemorrissey.labs.subscaleview.internal.URI_PATH_ASSET
+import com.davemorrissey.labs.subscaleview.internal.URI_SCHEME_ZIP
 import com.davemorrissey.labs.subscaleview.internal.isTilingEnabled
 import com.davemorrissey.labs.subscaleview.internal.panBy
 import com.davemorrissey.labs.subscaleview.internal.sHeight
@@ -69,8 +73,11 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
+import java.io.FileInputStream
+import java.io.InputStream
 import java.util.Locale
 import java.util.concurrent.locks.ReentrantReadWriteLock
+import java.util.zip.ZipFile
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -479,14 +486,14 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 			else -> {
 				sRegion = imageSource.region
-				uri = imageSource.toUri(context).also { uri ->
-					if (imageSource.isTilingEnabled || sRegion != null) {
-						// Load the bitmap using tile decoding.
-						initTiles(regionDecoderFactory, uri)
-					} else {
-						// Load the bitmap as a single image.
-						loadBitmap(uri, false)
-					}
+				val resolvedUri = imageSource.toUri(context)
+				uri = resolvedUri
+				if (shouldUseTileDecoding(imageSource, resolvedUri)) {
+					// Load the bitmap using tile decoding.
+					initTiles(regionDecoderFactory, resolvedUri)
+				} else {
+					// Load the bitmap as a single image.
+					loadBitmap(resolvedUri, false)
 				}
 			}
 		}
@@ -2198,6 +2205,93 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 
 	private fun Bitmap.fullHeight() = height * _downSampling
 
+	private fun shouldUseTileDecoding(imageSource: ImageSource, resolvedUri: Uri): Boolean {
+		if (animatedImageDecoderFactory != null && isAnimatedSource(resolvedUri)) {
+			return false
+		}
+		return imageSource.isTilingEnabled || sRegion != null
+	}
+
+	private fun isAnimatedSource(resolvedUri: Uri): Boolean {
+		if (animatedImageDecoderFactory == null) {
+			return false
+		}
+		val mime = runCatching {
+			detectImageFormat(context, resolvedUri)?.lowercase(Locale.US)
+		}.getOrNull()
+		if (mime != null) {
+			if (mime in ANIMATED_MIME_TYPES) {
+				return true
+			}
+			if (mime == MIME_WEBP) {
+				return isAnimatedWebp(resolvedUri)
+			}
+		} else {
+			val path = resolvedUri.toString().lowercase(Locale.US)
+			if (ANIMATED_EXTENSIONS.any { path.endsWith(it) }) {
+				return true
+			}
+			if (path.endsWith(".webp")) {
+				return isAnimatedWebp(resolvedUri)
+			}
+		}
+		return false
+	}
+
+	private fun isAnimatedWebp(resolvedUri: Uri): Boolean {
+		return readFromUri(resolvedUri) { stream ->
+			val header = ByteArray(WEBP_HEADER_SIZE)
+			if (stream.read(header) < WEBP_HEADER_SIZE) {
+				return@readFromUri false
+			}
+			if (!header.copyOfRange(0, 4).contentEquals(RIFF_SIGNATURE) ||
+				!header.copyOfRange(8, 12).contentEquals(WEBP_SIGNATURE)
+			) {
+				return@readFromUri false
+			}
+			if (!header.copyOfRange(12, 16).contentEquals(VP8X_CHUNK)) {
+				return@readFromUri false
+			}
+			val flags = header[20].toInt()
+			(flags and WEBP_ANIMATION_FLAG) != 0
+		} ?: false
+	}
+
+	private inline fun <T> readFromUri(uri: Uri, block: (InputStream) -> T): T? {
+		return when (uri.scheme) {
+			ContentResolver.SCHEME_CONTENT,
+			ContentResolver.SCHEME_ANDROID_RESOURCE -> {
+				context.contentResolver.openInputStream(uri)?.use(block)
+			}
+
+			ContentResolver.SCHEME_FILE -> openFileStream(uri)?.use(block)
+
+			URI_SCHEME_ZIP -> {
+				val entryName = uri.fragment ?: return null
+				ZipFile(uri.schemeSpecificPart).use { zip ->
+					val entry = zip.getEntry(entryName) ?: return null
+					zip.getInputStream(entry).use(block)
+				}
+			}
+
+			else -> null
+		}
+	}
+
+	private fun openFileStream(uri: Uri): InputStream? {
+		val path = uri.schemeSpecificPart ?: return null
+		return if (path.startsWith(URI_PATH_ASSET, ignoreCase = true)) {
+			val assetName = path.substring(URI_PATH_ASSET.length)
+			runCatching {
+				context.assets.open(assetName)
+			}.getOrNull()
+		} else {
+			runCatching {
+				FileInputStream(path)
+			}.getOrNull()
+		}
+	}
+
 	/**
 	 * Called once when the view is initialised, has dimensions, and will display an image on the
 	 * next draw. This is triggered at the same time as
@@ -2305,5 +2399,21 @@ public open class SubsamplingScaleImageView @JvmOverloads constructor(
 		@JvmStatic
 		@Deprecated("This should be managed in decoder", level = DeprecationLevel.ERROR)
 		public var preferredBitmapConfig: Bitmap.Config? = null
+
+		private val ANIMATED_MIME_TYPES = setOf(
+			"image/gif",
+			"image/heif",
+			"image/heifs",
+			"image/heic",
+			"image/heics",
+			"image/avif",
+		)
+		private val ANIMATED_EXTENSIONS = listOf(".gif", ".heif", ".heifs", ".heic", ".heics", ".avif")
+		private const val MIME_WEBP = "image/webp"
+		private const val WEBP_HEADER_SIZE = 21
+		private const val WEBP_ANIMATION_FLAG = 0x02
+		private val RIFF_SIGNATURE = byteArrayOf('R'.code.toByte(), 'I'.code.toByte(), 'F'.code.toByte(), 'F'.code.toByte())
+		private val WEBP_SIGNATURE = byteArrayOf('W'.code.toByte(), 'E'.code.toByte(), 'B'.code.toByte(), 'P'.code.toByte())
+		private val VP8X_CHUNK = byteArrayOf('V'.code.toByte(), 'P'.code.toByte(), '8'.code.toByte(), 'X'.code.toByte())
 	}
 }
